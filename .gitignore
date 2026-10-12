@@ -1,0 +1,14 @@
+downloads/
+runtime/
+state/
+logs/
+artifacts/
+*.exe
+*.pdb
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
