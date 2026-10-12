@@ -32,6 +32,7 @@ namespace IPhoneMirror
         internal int ProcessId { get { return process == null ? 0 : process.Id; } }
         internal bool Running { get { return process != null && !process.HasExited; } }
         internal bool Ready { get; private set; }
+        internal volatile VideoGeometry Video;
 
         private void Log(string line)
         {
@@ -50,6 +51,7 @@ namespace IPhoneMirror
             Dispose();
             Ready = false;
             LastError = "";
+            Video = null;
             if (!File.Exists(EnginePath)) throw new FileNotFoundException("미러링 엔진이 없습니다. setup-runtime.ps1을 먼저 실행해 주세요.", EnginePath);
             // Check TCP and UDP separately: another receiver must never be mistaken for ours.
             var ip = IPGlobalProperties.GetIPGlobalProperties();
@@ -82,6 +84,11 @@ namespace IPhoneMirror
             info.EnvironmentVariables["PATH"] = System.IO.Path.GetDirectoryName(EnginePath) + ";" + Environment.GetEnvironmentVariable("PATH");
             // No external plugin scanner is bundled; inspect plugins inside the receiver process.
             info.EnvironmentVariables["GST_REGISTRY_FORK"] = "no";
+            // The pinned sink reports negotiated dimensions when caps change.
+            // Limit diagnostics to this category; no packet/frame tracing is needed.
+            info.EnvironmentVariables["GST_DEBUG"] = "d3d11videosink:5";
+            info.EnvironmentVariables["GST_DEBUG_NO_COLOR"] = "1";
+            info.EnvironmentVariables.Remove("GST_DEBUG_FILE");
             Log("Starting receiver; audio=" + audio + "; software=" + software + ". Connection code omitted.");
             process = new Process { StartInfo = info };
             process.OutputDataReceived += ReadLine;
@@ -97,8 +104,17 @@ namespace IPhoneMirror
 
         private void ReadLine(object sender, DataReceivedEventArgs e)
         {
+            if (!Object.ReferenceEquals(sender, process)) return;
             var line = e.Data;
             if (String.IsNullOrWhiteSpace(line)) return;
+            var video = VideoGeometry.Parse(line);
+            if (video != null)
+            {
+                Video = video;
+                Log("Video dimensions: " + video.Width + "x" + video.Height);
+            }
+            // Retain warnings/errors, but avoid writing verbose sink diagnostics.
+            if (line.Contains("d3d11videosink") && line.Contains("DEBUG")) return;
             // Connection codes are shown only in the UI, not saved in diagnostic logs.
             if (line.IndexOf("password", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 line.IndexOf("pin code", StringComparison.OrdinalIgnoreCase) >= 0) return;
@@ -141,6 +157,7 @@ namespace IPhoneMirror
         internal void Stop()
         {
             Ready = false;
+            Video = null;
             if (process == null) return;
             try
             {
@@ -158,40 +175,11 @@ namespace IPhoneMirror
         public void Dispose() { Stop(); }
     }
 
-    internal static class Native
-    {
-        internal delegate bool WindowCallback(IntPtr window, IntPtr parameter);
-        [DllImport("user32.dll")] internal static extern bool EnumWindows(WindowCallback callback, IntPtr parameter);
-        [DllImport("user32.dll")] internal static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
-        [DllImport("user32.dll")] internal static extern bool IsWindowVisible(IntPtr window);
-        [DllImport("user32.dll", CharSet = CharSet.Unicode)] internal static extern int GetWindowText(IntPtr window, StringBuilder text, int count);
-        [DllImport("user32.dll", CharSet = CharSet.Unicode)] internal static extern bool SetWindowText(IntPtr window, string text);
-
-        internal static bool HasVideoWindow(int processId)
-        {
-            bool found = false;
-            EnumWindows(delegate(IntPtr handle, IntPtr parameter)
-            {
-                uint owner;
-                GetWindowThreadProcessId(handle, out owner);
-                if (owner != processId || !IsWindowVisible(handle)) return true;
-                var title = new StringBuilder(512);
-                GetWindowText(handle, title, title.Capacity);
-                if (title.ToString().IndexOf("renderer", StringComparison.OrdinalIgnoreCase) >= 0 || title.ToString() == "iPhone 화면")
-                {
-                    SetWindowText(handle, "iPhone 화면");
-                    found = true;
-                }
-                return true;
-            }, IntPtr.Zero);
-            return found;
-        }
-    }
-
     internal sealed class Controller : IDisposable
     {
         internal readonly Window Window;
         private readonly Receiver receiver = new Receiver();
+        private readonly VideoWindowFollower videoWindow = new VideoWindowFollower();
         private readonly Button start;
         private readonly CheckBox audio, software;
         private readonly TextBlock status, code, detail;
@@ -231,7 +219,7 @@ namespace IPhoneMirror
                 }
                 catch (Exception ex) { MessageBox.Show(Window, ex.Message, "로그를 열지 못했습니다"); }
             };
-            timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+            timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
             timer.Tick += delegate { UpdateStatus(); };
             Window.Closed += delegate { Dispose(); };
         }
@@ -256,6 +244,7 @@ namespace IPhoneMirror
                     return;
                 }
                 receiver.Start(audio.IsChecked == true, software.IsChecked == true);
+                videoWindow.Reset();
                 started = DateTime.UtcNow;
                 code.Text = receiver.Code;
                 start.Content = "미러링 중지";
@@ -290,9 +279,11 @@ namespace IPhoneMirror
                     SetStatus("수신기가 종료되었습니다", "#D75C64", "진단 로그에서 원인을 확인해 주세요. " + receiver.LastError);
                     return;
                 }
-                if (Native.HasVideoWindow(receiver.ProcessId))
+                var handle = Native.FindVideoWindow(receiver.ProcessId);
+                videoWindow.Update(handle, receiver.Video);
+                if (handle != IntPtr.Zero)
                 {
-                    SetStatus("아이폰 화면 창이 열렸습니다", "#35A47D", "화면은 별도 창에 표시됩니다. Alt + Enter로 전체 화면을 전환합니다.");
+                    SetStatus("아이폰 화면 창이 열렸습니다", "#35A47D", "아이폰 회전에 맞춰 영상 창 크기도 바뀝니다. Alt + Enter로 전체 화면을 전환합니다.");
                 }
                 else if (receiver.Ready || receiver.Probe())
                 {

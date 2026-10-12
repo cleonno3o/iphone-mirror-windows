@@ -6,4 +6,5 @@ if ($render.ExitCode -ne 0) { throw 'UI render failed. See logs/application-erro
 $smoke = Start-Process -FilePath $exe -ArgumentList '--smoke' -WindowStyle Hidden -PassThru -Wait
 Get-Content -LiteralPath (Join-Path $PSScriptRoot 'artifacts\smoke-test.txt')
 if ($smoke.ExitCode -ne 0) { throw 'Receiver smoke test failed. See logs/receiver.log.' }
-Write-Output 'Build, WPF render, receiver start/response/stop and restart passed. Physical iPhone test remains.'
+& (Join-Path $PSScriptRoot 'tests\test-rotation.ps1')
+Write-Output 'Build, WPF render, receiver start/response/stop, restart and native video window rotation passed. Physical iPhone rotation confirmation remains.'

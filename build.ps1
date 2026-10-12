@@ -6,6 +6,7 @@ $references = @('System.dll', 'System.Core.dll', 'System.Xaml.dll', 'WPF\Windows
 $compilerArgs = @('/nologo', '/target:winexe', '/platform:x64', '/optimize+', '/utf8output', ('/out:' + (Join-Path $PSScriptRoot 'iPhoneMirror.exe')), ('/win32manifest:' + (Join-Path $PSScriptRoot 'app.manifest')), ('/resource:' + (Join-Path $PSScriptRoot 'src\MainWindow.xaml') + ',MainWindow.xaml'))
 foreach ($reference in $references) { $compilerArgs += '/reference:' + (Join-Path $framework $reference) }
 $compilerArgs += Join-Path $PSScriptRoot 'src\Program.cs'
+$compilerArgs += Join-Path $PSScriptRoot 'src\VideoWindow.cs'
 & $compiler @compilerArgs
 if ($LASTEXITCODE -ne 0) { throw 'Build failed.' }
 Write-Output (Join-Path $PSScriptRoot 'iPhoneMirror.exe')
