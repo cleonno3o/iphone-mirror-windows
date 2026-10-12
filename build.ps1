@@ -7,6 +7,7 @@ $compilerArgs = @('/nologo', '/target:winexe', '/platform:x64', '/optimize+', '/
 foreach ($reference in $references) { $compilerArgs += '/reference:' + (Join-Path $framework $reference) }
 $compilerArgs += Join-Path $PSScriptRoot 'src\Program.cs'
 $compilerArgs += Join-Path $PSScriptRoot 'src\VideoWindow.cs'
+$compilerArgs += Join-Path $PSScriptRoot 'src\FirewallSession.cs'
 & $compiler @compilerArgs
 if ($LASTEXITCODE -ne 0) { throw 'Build failed.' }
 Write-Output (Join-Path $PSScriptRoot 'iPhoneMirror.exe')

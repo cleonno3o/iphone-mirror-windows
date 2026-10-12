@@ -1,4 +1,5 @@
 using System;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -9,6 +10,7 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Markup;
@@ -24,6 +26,8 @@ namespace IPhoneMirror
         internal const int Port = 7100;
         internal readonly string Root = AppDomain.CurrentDomain.BaseDirectory;
         private Process process;
+        private FirewallSession firewall;
+        private ReceiverJob job;
         private readonly object logLock = new object();
         internal string LastError = "";
         internal string Code { get; private set; }
@@ -32,6 +36,8 @@ namespace IPhoneMirror
         internal int ProcessId { get { return process == null ? 0 : process.Id; } }
         internal bool Running { get { return process != null && !process.HasExited; } }
         internal bool Ready { get; private set; }
+        internal bool HasSession { get { return process != null || firewall != null; } }
+        internal bool FirewallHealthy { get { return firewall != null && firewall.Healthy; } }
         internal volatile VideoGeometry Video;
 
         private void Log(string line)
@@ -45,7 +51,7 @@ namespace IPhoneMirror
             }
         }
 
-        internal void Start(bool audio, bool software)
+        internal void Start(bool audio, bool software, bool manageFirewall = true)
         {
             if (Running) return;
             Dispose();
@@ -90,16 +96,30 @@ namespace IPhoneMirror
             info.EnvironmentVariables["GST_DEBUG_NO_COLOR"] = "1";
             info.EnvironmentVariables.Remove("GST_DEBUG_FILE");
             Log("Starting receiver; audio=" + audio + "; software=" + software + ". Connection code omitted.");
-            process = new Process { StartInfo = info };
-            process.OutputDataReceived += ReadLine;
-            process.ErrorDataReceived += ReadLine;
             try
             {
+                if (manageFirewall)
+                {
+                    firewall = new FirewallSession();
+                    firewall.Open(Root);
+                    Log("Temporary firewall rules ready.");
+                }
+                job = new ReceiverJob();
+                process = new Process { StartInfo = info };
+                process.OutputDataReceived += ReadLine;
+                process.ErrorDataReceived += ReadLine;
                 if (!process.Start()) throw new InvalidOperationException("수신기를 실행하지 못했습니다.");
+                job.Add(process);
                 process.BeginOutputReadLine();
                 process.BeginErrorReadLine();
+                if (firewall != null) firewall.Bind(process);
             }
-            catch { Dispose(); throw; }
+            catch (Exception startup)
+            {
+                try { Stop(); }
+                catch (Exception cleanup) { throw new InvalidOperationException(startup.Message + " / 정리: " + cleanup.Message, startup); }
+                throw;
+            }
         }
 
         private void ReadLine(object sender, DataReceivedEventArgs e)
@@ -118,7 +138,8 @@ namespace IPhoneMirror
             // Connection codes are shown only in the UI, not saved in diagnostic logs.
             if (line.IndexOf("password", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 line.IndexOf("pin code", StringComparison.OrdinalIgnoreCase) >= 0) return;
-            if (!String.IsNullOrEmpty(Code)) line = line.Replace(Code, "[code]");
+            var activeCode = Code;
+            if (!String.IsNullOrEmpty(activeCode)) line = line.Replace(activeCode, "[code]");
             if (line.IndexOf("error", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 line.IndexOf("failed", StringComparison.OrdinalIgnoreCase) >= 0) LastError = line;
             Log(line);
@@ -158,19 +179,38 @@ namespace IPhoneMirror
         {
             Ready = false;
             Video = null;
-            if (process == null) return;
+            Exception failure = null;
             try
             {
-                if (!process.HasExited)
+                if (process != null)
                 {
-                    // This CLI has no IPC stop command. Terminate only the process we started.
-                    process.Kill();
-                    process.WaitForExit(3000);
+                    if (!process.HasExited)
+                    {
+                        process.Kill();
+                        if (!process.WaitForExit(3000)) throw new IOException("수신기 종료를 확인하지 못했습니다.");
+                    }
+                    Log("Receiver stopped; exit=" + process.ExitCode);
                 }
-                Log("Receiver stopped; exit=" + process.ExitCode);
             }
             catch (InvalidOperationException) { /* Process creation may have failed before it acquired a PID. */ }
-            finally { process.Dispose(); process = null; Code = null; }
+            catch (Exception ex) { failure = ex; }
+            finally
+            {
+                if (job != null) { job.Dispose(); job = null; }
+                if (process != null) { process.Dispose(); process = null; }
+                Code = null;
+                if (firewall != null)
+                {
+                    try
+                    {
+                        firewall.Dispose();
+                        if (firewall.CleanupConfirmed) Log("Temporary firewall rule cleanup confirmed.");
+                    }
+                    catch (Exception ex) { failure = new IOException("방화벽 정리를 확인하지 못했습니다. 다시 시작하여 정리해 주세요. " + ex.Message, ex); }
+                    finally { firewall = null; }
+                }
+            }
+            if (failure != null) { Log(failure.Message); throw failure; }
         }
         public void Dispose() { Stop(); }
     }
@@ -186,6 +226,7 @@ namespace IPhoneMirror
         private readonly System.Windows.Shapes.Ellipse dot;
         private readonly DispatcherTimer timer;
         private DateTime started;
+        private bool busy, closeRequested, closeAllowed;
 
         internal Controller()
         {
@@ -204,7 +245,8 @@ namespace IPhoneMirror
                 MessageBox.Show(Window,
                     "• PC와 아이폰을 같은 공유기에 연결해 주세요. PC는 유선 연결도 가능합니다.\n\n" +
                     "• 목록에 PC가 없으면 Windows 네트워크 프로필, 방화벽, VPN 또는 공유기의 기기 격리를 확인해 주세요.\n\n" +
-                    "• Windows 방화벽 알림이 나타나면 사용 중인 신뢰하는 네트워크에서 uxplay.exe 통신을 허용해 주세요.\n\n" +
+                    "• 시작할 때 방화벽 관리용 Windows PowerShell의 관리자 승인이 필요합니다. 취소하면 미러링을 시작하지 않습니다.\n\n" +
+                    "• 개인 네트워크의 같은 서브넷에서만 임시 통신을 허용합니다. 중지·종료 시 수신기와 임시 규칙을 정리합니다.\n\n" +
                     "• 화면이 검거나 멈추면 중지 후 ‘호환 모드’를 켜고 다시 연결해 주세요.\n\n" +
                     "• 첫 버전은 화면 보기 전용입니다. 터치·홈·키보드는 다음 개발 단계입니다. iOS 27은 실제 아이폰으로 호환성을 확인해야 합니다.",
                     "연결 도움말", MessageBoxButton.OK, MessageBoxImage.Information);
@@ -221,6 +263,7 @@ namespace IPhoneMirror
             };
             timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
             timer.Tick += delegate { UpdateStatus(); };
+            Window.Closing += OnClosing;
             Window.Closed += delegate { Dispose(); };
         }
 
@@ -231,34 +274,82 @@ namespace IPhoneMirror
             detail.Text = description;
         }
 
-        internal void Toggle()
+        internal async void Toggle()
         {
+            if (busy) return;
+            busy = true;
+            timer.Stop();
+            start.IsEnabled = audio.IsEnabled = software.IsEnabled = false;
+            bool stopping = receiver.HasSession;
+            string failure = null;
             try
             {
-                if (receiver.Running)
+                if (stopping)
                 {
-                    timer.Stop();
-                    receiver.Stop();
+                    SetStatus("미러링과 임시 허용 규칙을 정리하고 있습니다", "#D49A42", "정리가 완료될 때까지 잠시 기다려 주세요.");
+                    await Task.Run(delegate { receiver.Stop(); });
                     ResetControls();
-                    SetStatus("미러링을 중지했습니다", "#9AA2B4", "다시 시작하면 새로운 연결 코드가 표시됩니다.");
-                    return;
+                    SetStatus("미러링을 중지했습니다", "#9AA2B4", "수신기 종료와 임시 방화벽 규칙 삭제를 확인했습니다.");
                 }
-                receiver.Start(audio.IsChecked == true, software.IsChecked == true);
-                videoWindow.Reset();
-                started = DateTime.UtcNow;
-                code.Text = receiver.Code;
-                start.Content = "미러링 중지";
-                audio.IsEnabled = software.IsEnabled = false;
-                SetStatus("수신기를 시작하고 있습니다", "#D49A42", "준비가 완료되면 아이폰에서 화면 미러링을 선택해 주세요.");
-                timer.Start();
+                else
+                {
+                    bool withAudio = audio.IsChecked == true, withSoftware = software.IsChecked == true;
+                    SetStatus("방화벽을 준비하고 있습니다", "#D49A42", "Windows 관리자 승인 창을 확인해 주세요. 승인 취소 시 시작하지 않습니다.");
+                    await Task.Run(delegate { receiver.Start(withAudio, withSoftware); });
+                    videoWindow.Reset();
+                    started = DateTime.UtcNow;
+                    code.Text = receiver.Code;
+                    start.Content = "미러링 중지";
+                    audio.IsEnabled = software.IsEnabled = false;
+                    SetStatus("수신기를 시작하고 있습니다", "#D49A42", "임시 방화벽 허용이 적용됐습니다. 아이폰에서 화면 미러링을 선택해 주세요.");
+                    timer.Start();
+                }
             }
             catch (Exception ex)
             {
                 timer.Stop();
-                receiver.Stop();
-                ResetControls();
-                SetStatus("시작하지 못했습니다", "#D75C64", ex.Message);
+                failure = ex.Message;
             }
+            if (failure != null)
+            {
+                try { await Task.Run(delegate { receiver.Stop(); }); }
+                catch (Exception cleanup) { failure += " / " + cleanup.Message; }
+                ResetControls();
+                SetStatus(stopping ? "정리 상태를 확인해 주세요" : "시작하지 못했습니다", "#D75C64", failure);
+            }
+            busy = false;
+            start.IsEnabled = true;
+            if (closeRequested) Window.Close();
+        }
+
+        private async void OnClosing(object sender, CancelEventArgs e)
+        {
+            if (closeAllowed) return;
+            e.Cancel = true;
+            closeRequested = true;
+            if (busy) return;
+            busy = true;
+            timer.Stop();
+            start.IsEnabled = false;
+            SetStatus("종료 준비 중입니다", "#D49A42", "수신기와 임시 방화벽 규칙을 정리한 뒤 창이 닫힙니다.");
+            try { await Task.Run(delegate { receiver.Stop(); }); }
+            catch (Exception ex) { MessageBox.Show(Window, ex.Message, "방화벽 정리 확인 필요", MessageBoxButton.OK, MessageBoxImage.Warning); }
+            finally { closeAllowed = true; busy = false; Window.Close(); }
+        }
+
+        private async void StopAfterFailure(string message)
+        {
+            if (busy) return;
+            busy = true;
+            timer.Stop();
+            start.IsEnabled = false;
+            try { await Task.Run(delegate { receiver.Stop(); }); }
+            catch (Exception ex) { message += " / " + ex.Message; }
+            ResetControls();
+            SetStatus("미러링이 중지되었습니다", "#D75C64", message);
+            busy = false;
+            start.IsEnabled = true;
+            if (closeRequested) Window.Close();
         }
 
         private void ResetControls()
@@ -270,13 +361,17 @@ namespace IPhoneMirror
 
         private void UpdateStatus()
         {
+            if (busy) return;
             try
             {
                 if (!receiver.Running)
                 {
-                    timer.Stop();
-                    ResetControls();
-                    SetStatus("수신기가 종료되었습니다", "#D75C64", "진단 로그에서 원인을 확인해 주세요. " + receiver.LastError);
+                    StopAfterFailure("수신기가 종료되어 정리를 진행했습니다. " + receiver.LastError);
+                    return;
+                }
+                if (!receiver.FirewallHealthy)
+                {
+                    StopAfterFailure("방화벽 관리 연결이 끊겼습니다. 다시 시작하여 임시 규칙을 정리해 주세요.");
                     return;
                 }
                 var handle = Native.FindVideoWindow(receiver.ProcessId);
@@ -296,8 +391,7 @@ namespace IPhoneMirror
             }
             catch (Exception ex)
             {
-                timer.Stop();
-                SetStatus("상태를 확인하지 못했습니다", "#D75C64", ex.Message);
+                StopAfterFailure(ex.Message);
             }
         }
 
@@ -367,7 +461,9 @@ namespace IPhoneMirror
                 {
                     for (int cycle = 1; cycle <= 2; cycle++)
                     {
-                        receiver.Start(false, cycle == 2);
+                        // This local transport test does not request administrator
+                        // access or mutate firewall policy. Device testing is separate.
+                        receiver.Start(false, cycle == 2, false);
                         var deadline = DateTime.UtcNow.AddSeconds(20);
                         while (DateTime.UtcNow < deadline && receiver.Running && !receiver.Probe()) Thread.Sleep(400);
                         if (!receiver.Running || !receiver.Ready) throw new Exception("RTSP receiver did not become ready. " + receiver.LastError);

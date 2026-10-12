@@ -56,7 +56,7 @@
             </StackPanel>
             <Button x:Name="StartButton" Grid.Column="1" Content="미러링 시작" Background="#6557DB" Foreground="White" FontWeight="SemiBold" VerticalAlignment="Center"/>
           </Grid>
-          <TextBlock x:Name="DetailText" Text="같은 공유기에 연결한 다음 시작해 주세요." Foreground="#71788D" FontSize="12" Margin="0,18,0,0"/>
+          <TextBlock x:Name="DetailText" Text="같은 공유기에 연결해 주세요. 시작 시 임시 방화벽 허용을 위한 관리자 승인이 필요합니다." Foreground="#71788D" FontSize="12" Margin="0,18,0,0"/>
         </StackPanel>
       </Border>
       <TextBlock Text="아이폰에서 연결하기" FontSize="16" FontWeight="SemiBold" Margin="0,24,0,16"/>
